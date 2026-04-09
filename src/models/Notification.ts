@@ -27,4 +27,7 @@ const NotificationSchema = new Schema<NotificationDoc>(
 
 NotificationSchema.index({ deviceId: 1, timestamp: -1 });
 
+// Auto-delete after 2 days (172800 seconds)
+NotificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 172800 });
+
 export default mongoose.model<NotificationDoc>("AppNotification", NotificationSchema);
