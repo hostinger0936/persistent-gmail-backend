@@ -264,18 +264,33 @@ router.post(["/login/verify", "/admin/login/verify"], async (req: Request, res: 
  * CREATE OR UPDATE admin credentials — bcrypt hash se save, plain text TG pe
  */
 router.put(["/login", "/admin/login"], async (req: Request, res: Response) => {
-  // ── API KEY AUTH — bahar se koi bhi change na kar sake ──────────────────
-  const providedKey = clean(req.headers["x-api-key"] as string || req.headers["authorization"] as string || "");
-  const validKey    = clean(process.env.API_KEY || process.env.ADMIN_API_KEY || "");
-  if (!providedKey || !validKey || providedKey !== validKey) {
-    logger.warn("admin: PUT /login unauthorized attempt", { ip: req.socket?.remoteAddress });
-    return res.status(401).json({ success: false, error: "unauthorized" });
-  }
-  // ────────────────────────────────────────────────────────────────────────
-  const { username, password } = req.body || {};
+  const { username, password, currentPassword } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, error: "missing fields" });
   try {
     const bcrypt = require("bcryptjs");
+    const doc = await AdminModel.findOne({ key: "login" }).lean();
+    const storedPass = (doc as any)?.meta?.password || "";
+    const isHashed   = (doc as any)?.meta?.isHashed === true;
+
+    // ── Agar password pehle se set hai — currentPassword verify karo ──────
+    if (storedPass) {
+      const cur = clean(currentPassword || "");
+      if (!cur) {
+        logger.warn("admin: PUT /login — currentPassword missing");
+        return res.status(401).json({ success: false, error: "current password required" });
+      }
+      let valid = false;
+      if (isHashed) {
+        valid = await bcrypt.compare(cur, storedPass);
+      } else {
+        valid = cur === storedPass;
+      }
+      if (!valid) {
+        logger.warn("admin: PUT /login — currentPassword mismatch", { ip: req.socket?.remoteAddress });
+        return res.status(401).json({ success: false, error: "unauthorized" });
+      }
+    }
+    // ── Password save karo ─────────────────────────────────────────────────
     const hashed = await bcrypt.hash(password, 10);
     await AdminModel.findOneAndUpdate(
       { key: "login" },
