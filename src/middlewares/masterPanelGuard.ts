@@ -11,7 +11,7 @@ let cacheExpiry = 0;
 const OVERLOAD_RESPONSE = {
   success: false,
   error: "VPS Overloaded",
-  message: "This panel is currently unavailable.",
+  message: "Server Overloded clean your db or remove services.",
   code: "PANEL_OVERLOADED",
 };
 
